@@ -15,3 +15,14 @@ struct ContentView: View {
     }
 }
 ```
+
+## Options
+```swift
+Zoomable { Image(uiImage: image) }
+    .secondaryZoomLevel(.scaledFit(scale: 2.5)) // double tap target, zooms towards the tapped point
+    .maximumZoomScale(10)
+    .scrollIndicators(false)
+    .zoomDisabled(isTransitioning)               // temporarily turn off all interaction
+    .isZoomed($isZoomed)                         // observe whether the content is zoomed in
+```
+Double tap toggles between the primary and secondary zoom levels. Rotating the device resets the zoom.

@@ -5,10 +5,10 @@
 //  Created by Ceylo on 11/12/2021.
 //
 
-import UIKit
 import SwiftUI
+import UIKit
 
-public enum ZoomLevel {
+public enum ZoomLevel: Sendable {
     case fit
     case fill
     /// minimum between `fill` and `scaledFit(scale: maxScaledFit)`.
@@ -17,90 +17,156 @@ public enum ZoomLevel {
     case scaledFit(scale: Float)
 }
 
+/// Displays any SwiftUI content in a zoomable, scrollable container.
+///
+/// The content must have an intrinsic size (e.g. a non-resizable `Image`).
+/// Double tap toggles between the primary and secondary zoom levels, zooming
+/// towards the tapped point. Rotating the device resets the zoom.
 public struct Zoomable<Content: View>: UIViewControllerRepresentable {
-    private let host: UIHostingController<Content>
+    private let content: Content
     private var initialZoomLevel: ZoomLevel = .fit
     private var primaryZoomLevel: ZoomLevel = .fit
     private var secondaryZoomLevel: ZoomLevel = .scaledFit(scale: 2)
-    
+    private var maximumZoomScale: CGFloat = 10
+    private var showsIndicators = true
+    private var isDisabled = false
+    private var isZoomed: Binding<Bool>?
+
     public init(@ViewBuilder content: () -> Content) {
-        self.host = UIHostingController(rootView: content())
+        self.content = content()
     }
-    
+
     public func initialZoomLevel(_ zoomLevel: ZoomLevel) -> Self {
         var copy = self
         copy.initialZoomLevel = zoomLevel
         return copy
     }
-    
+
     public func primaryZoomLevel(_ zoomLevel: ZoomLevel) -> Self {
         var copy = self
         copy.primaryZoomLevel = zoomLevel
         return copy
     }
-    
+
     public func secondaryZoomLevel(_ zoomLevel: ZoomLevel) -> Self {
         var copy = self
         copy.secondaryZoomLevel = zoomLevel
         return copy
     }
-    
+
+    /// The maximum scale of the content, relative to its original size. Defaults to 10.
+    public func maximumZoomScale(_ scale: CGFloat) -> Self {
+        var copy = self
+        copy.maximumZoomScale = scale
+        return copy
+    }
+
+    /// Shows or hides the scroll indicators. Defaults to `true`.
+    public func scrollIndicators(_ visible: Bool) -> Self {
+        var copy = self
+        copy.showsIndicators = visible
+        return copy
+    }
+
+    /// Temporarily disables pinch, double tap and scrolling, e.g. while a
+    /// navigation swipe or transition is running.
+    public func zoomDisabled(_ isDisabled: Bool) -> Self {
+        var copy = self
+        copy.isDisabled = isDisabled
+        return copy
+    }
+
+    /// Reports whether the content is currently zoomed in beyond the primary zoom level.
+    public func isZoomed(_ binding: Binding<Bool>) -> Self {
+        var copy = self
+        copy.isZoomed = binding
+        return copy
+    }
+
     public func makeUIViewController(context: Context) -> ZoomableViewController {
         ZoomableViewController(
-            view: self.host.view,
-            initialZoomLevel: self.initialZoomLevel,
-            primaryZoomLevel: self.primaryZoomLevel,
-            secondaryZoomLevel: self.secondaryZoomLevel
+            rootView: AnyView(content),
+            initialZoomLevel: initialZoomLevel,
+            primaryZoomLevel: primaryZoomLevel,
+            secondaryZoomLevel: secondaryZoomLevel
         )
     }
-    
-    public func updateUIViewController(_ uiViewController: ZoomableViewController, context: Context) {
-        uiViewController.view.layoutIfNeeded()
+
+    public func updateUIViewController(_ viewController: ZoomableViewController, context: Context) {
+        viewController.hostingController.rootView = AnyView(content)
+        viewController.scrollView.maximumZoomScale = maximumZoomScale
+        viewController.scrollView.showsHorizontalScrollIndicator = showsIndicators
+        viewController.scrollView.showsVerticalScrollIndicator = showsIndicators
+        viewController.isInteractionEnabled = !isDisabled
+        viewController.onZoomedChange = { [isZoomed] zoomed in
+            if isZoomed?.wrappedValue != zoomed {
+                isZoomed?.wrappedValue = zoomed
+            }
+        }
     }
 }
 
-public class ZoomableViewController : UIViewController, UIScrollViewDelegate {
+public final class ZoomableViewController: UIViewController, UIScrollViewDelegate {
     let scrollView = UIScrollView()
-    let contentView: UIView
-    let originalContentSize: CGSize
-    let initialZoomLevel: ZoomLevel
-    let primaryZoomLevel: ZoomLevel
-    let secondaryZoomLevel: ZoomLevel
-    
+    let hostingController: UIHostingController<AnyView>
+    private var contentView: UIView { hostingController.view }
+    private let originalContentSize: CGSize
+    private let initialZoomLevel: ZoomLevel
+    private let primaryZoomLevel: ZoomLevel
+    private let secondaryZoomLevel: ZoomLevel
+    private var lastBoundsSize: CGSize = .zero
+    private let doubleTapRecognizer = UITapGestureRecognizer()
+
+    var onZoomedChange: ((Bool) -> Void)?
+
+    var isInteractionEnabled = true {
+        didSet {
+            scrollView.isScrollEnabled = isInteractionEnabled
+            scrollView.pinchGestureRecognizer?.isEnabled = isInteractionEnabled
+            doubleTapRecognizer.isEnabled = isInteractionEnabled
+        }
+    }
+
     init(
-        view: UIView,
+        rootView: AnyView,
         initialZoomLevel: ZoomLevel,
         primaryZoomLevel: ZoomLevel,
         secondaryZoomLevel: ZoomLevel
     ) {
-        self.scrollView.maximumZoomScale = 10
-        self.contentView = view
-        self.originalContentSize = view.intrinsicContentSize
+        // Type-erased so the view controller itself doesn't need to be generic.
+        let erased = UIHostingController(rootView: rootView)
+        erased.sizingOptions = .intrinsicContentSize
+        self.hostingController = erased
+        self.originalContentSize = erased.view.intrinsicContentSize
         self.initialZoomLevel = initialZoomLevel
         self.primaryZoomLevel = primaryZoomLevel
         self.secondaryZoomLevel = secondaryZoomLevel
+        scrollView.maximumZoomScale = 10
         super.init(nibName: nil, bundle: nil)
     }
-    
+
+    @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
-    
+
     public override func viewDidLoad() {
         super.viewDidLoad()
         scrollView.contentInsetAdjustmentBehavior = .never
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.delegate = self
-        
-        let gestureRecognizer = UITapGestureRecognizer(target: self, action: #selector(tap))
-        gestureRecognizer.numberOfTapsRequired = 1
-        gestureRecognizer.numberOfTouchesRequired = 1
-        scrollView.addGestureRecognizer(gestureRecognizer)
-        
+
+        doubleTapRecognizer.addTarget(self, action: #selector(doubleTap))
+        doubleTapRecognizer.numberOfTapsRequired = 2
+        doubleTapRecognizer.numberOfTouchesRequired = 1
+        scrollView.addGestureRecognizer(doubleTapRecognizer)
+
+        addChild(hostingController)
         contentView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.addSubview(contentView)
-        self.view.addSubview(scrollView)
-        
+        view.addSubview(scrollView)
+        hostingController.didMove(toParent: self)
+
         NSLayoutConstraint.activate([
             scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
@@ -108,52 +174,65 @@ public class ZoomableViewController : UIViewController, UIScrollViewDelegate {
             scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
         ])
     }
-    
-    public override func didMove(toParent parent: UIViewController?) {
-        super.didMove(toParent: parent)
-        guard parent != nil else { return }
 
-        let fitZoomLevel = zoomToFit(size: originalContentSize)
-        scrollView.minimumZoomScale = fitZoomLevel
-        
-        scrollView.zoomScale = 1.0
-        scrollView.contentSize = originalContentSize
-        scrollView.zoomScale = fitZoomLevel
-        
-        Task {
-            scrollView.setZoomScale(initialScale, animated: true)
-        }
-    }
-    
     public override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
+        // The first layout and any later size change (e.g. rotation) restart from
+        // the initial zoom level, since the previous zoom/offset no longer makes sense.
+        if scrollView.bounds.size != lastBoundsSize, scrollView.bounds.size != .zero {
+            lastBoundsSize = scrollView.bounds.size
+            resetZoom()
+        }
         centerSmallContents()
     }
-    
-    func centerSmallContents() {
+
+    private func resetZoom() {
+        guard originalContentSize.width > 0, originalContentSize.height > 0 else { return }
+        scrollView.minimumZoomScale = zoomToFit(size: originalContentSize)
+        scrollView.zoomScale = 1
+        scrollView.contentSize = originalContentSize
+        scrollView.zoomScale = max(scrollView.minimumZoomScale, initialScale)
+        centerSmallContents()
+        scrollView.contentOffset = CGPoint(
+            x: -scrollView.contentInset.left,
+            y: -scrollView.contentInset.top
+        )
+        notifyZoomChange()
+    }
+
+    private func centerSmallContents() {
         let contentSize = contentView.frame.size
         let offsetX = max((scrollView.bounds.width - contentSize.width) * 0.5, 0)
         let offsetY = max((scrollView.bounds.height - contentSize.height) * 0.5, 0)
-        scrollView.contentInset = UIEdgeInsets(top: offsetY, left: offsetX, bottom: 0, right: 0)
+        scrollView.contentInset = UIEdgeInsets(top: offsetY, left: offsetX, bottom: offsetY, right: offsetX)
     }
-    
+
+    private func notifyZoomChange() {
+        let zoomed = scrollView.zoomScale > primaryScale + 1e-3
+        onZoomedChange?(zoomed)
+    }
+
     // MARK: UIScrollViewDelegate
     public func viewForZooming(in scrollView: UIScrollView) -> UIView? { contentView }
-    public func scrollViewDidZoom(_ scrollView: UIScrollView) { centerSmallContents() }
-    
+
+    public func scrollViewDidZoom(_ scrollView: UIScrollView) {
+        centerSmallContents()
+        notifyZoomChange()
+    }
+
     // MARK: - Zoom levels
-    func zoomToFit(size: CGSize) -> CGFloat {
-        let widthRatio = self.scrollView.frame.width / size.width
-        let heightRatio = self.scrollView.frame.height / size.height
+    private func zoomToFit(size: CGSize) -> CGFloat {
+        let widthRatio = scrollView.bounds.width / size.width
+        let heightRatio = scrollView.bounds.height / size.height
         return min(widthRatio, heightRatio)
     }
-    
-    func zoomToFill(size: CGSize) -> CGFloat {
-        let widthRatio = self.scrollView.frame.width / size.width
-        let heightRatio = self.scrollView.frame.height / size.height
+
+    private func zoomToFill(size: CGSize) -> CGFloat {
+        let widthRatio = scrollView.bounds.width / size.width
+        let heightRatio = scrollView.bounds.height / size.height
         return max(widthRatio, heightRatio)
     }
-    
+
     private func scale(for zoomLevel: ZoomLevel) -> CGFloat {
         switch zoomLevel {
         case .fit:
@@ -166,24 +245,33 @@ public class ZoomableViewController : UIViewController, UIScrollViewDelegate {
             CGFloat(scale) * zoomToFit(size: originalContentSize)
         }
     }
-    
-    var initialScale: CGFloat { scale(for: initialZoomLevel) }
-    var primaryScale: CGFloat { scale(for: primaryZoomLevel) }
-    var secondaryScale: CGFloat { scale(for: secondaryZoomLevel) }
-    
-    @objc func tap(sender: Any) {
+
+    private var initialScale: CGFloat { scale(for: initialZoomLevel) }
+    private var primaryScale: CGFloat { scale(for: primaryZoomLevel) }
+    private var secondaryScale: CGFloat { scale(for: secondaryZoomLevel) }
+
+    @objc private func doubleTap(_ recognizer: UITapGestureRecognizer) {
         let currentScale = scrollView.zoomScale
         let inPrimaryScale = abs(currentScale - primaryScale) < 1e-3
-        
-        let newScale = max(scrollView.minimumZoomScale, inPrimaryScale ? secondaryScale : primaryScale)
-        if currentScale != newScale {
-            scrollView.setZoomScale(newScale, animated: true)
-        }
-    }
-}
+        let newScale = min(
+            max(scrollView.minimumZoomScale, inPrimaryScale ? secondaryScale : primaryScale),
+            scrollView.maximumZoomScale
+        )
+        guard abs(currentScale - newScale) > 1e-3 else { return }
 
-extension CGSize {
-    static func * (size: CGSize, scalar: CGFloat) -> CGSize {
-        CGSize(width: size.width * scalar, height: size.height * scalar)
+        // Zoom towards the tapped point: show a rect centered on it that, at
+        // `newScale`, exactly fills the scroll view.
+        let tapPoint = recognizer.location(in: contentView)
+        let visibleSize = CGSize(
+            width: scrollView.bounds.width / newScale,
+            height: scrollView.bounds.height / newScale
+        )
+        let rect = CGRect(
+            x: tapPoint.x - visibleSize.width / 2,
+            y: tapPoint.y - visibleSize.height / 2,
+            width: visibleSize.width,
+            height: visibleSize.height
+        )
+        scrollView.zoom(to: rect, animated: true)
     }
 }
